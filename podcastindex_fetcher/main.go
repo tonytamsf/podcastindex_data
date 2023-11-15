@@ -50,7 +50,7 @@ func main() {
 	defer file.Close()
 
 	// Determine the appropriate value for maxConcurrent based on system resources
-	maxConcurrent = runtime.NumCPU() * 2 // Adjust as needed
+	maxConcurrent = runtime.NumCPU() * 120 // Adjust as needed
 
 	// Create a channel to communicate between workers
 	urlsChannel := make(chan string, maxConcurrent)
