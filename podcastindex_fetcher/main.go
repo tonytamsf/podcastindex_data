@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
@@ -16,6 +17,7 @@ import (
 var (
 	db           *sqlx.DB
 	maxConcurrent int
+	maxRetries    = 10
 	wg           sync.WaitGroup
 )
 
@@ -33,7 +35,7 @@ func main() {
 	defer db.Close()
 
 	// Create table if not exists
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS urls (url TEXT, content TEXT)`)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY, content TEXT)`)
 	if err != nil {
 		fmt.Println("Error creating table:", err)
 		return
@@ -48,7 +50,7 @@ func main() {
 	defer file.Close()
 
 	// Determine the appropriate value for maxConcurrent based on system resources
-	maxConcurrent = runtime.NumCPU() * 150 // Adjust as needed
+	maxConcurrent = runtime.NumCPU() * 2 // Adjust as needed
 
 	// Create a channel to communicate between workers
 	urlsChannel := make(chan string, maxConcurrent)
@@ -86,21 +88,47 @@ func worker(urlsChannel <-chan string, semaphore chan struct{}) {
 		// Acquire a slot from the semaphore
 		semaphore <- struct{}{}
 
-		content, err := fetchURL(url)
-		if err != nil {
-			fmt.Printf("Error fetching %s: %v\n", url, err)
+		// Check if the URL is already in the database
+		if urlExistsInDatabase(url) {
+			fmt.Printf("Skipping URL (already in database): %s\n", url)
 		} else {
-			err = saveToDatabaseWithTransaction(url, content)
+			content, err := fetchURL(url)
 			if err != nil {
-				fmt.Printf("Error saving to database for %s: %v\n", url, err)
+				fmt.Printf("Error fetching %s: %v\n", url, err)
 			} else {
-				fmt.Printf("Processed URL: %s\n", url)
+				retryCount := 0
+				for {
+					err = saveToDatabaseWithRetry(url, content)
+					if err == nil || retryCount >= maxRetries {
+						break
+					}
+
+					retryCount++
+					fmt.Printf("Retrying (%d/%d) for %s\n", retryCount, maxRetries, url)
+					time.Sleep(time.Millisecond * 100) // Add a small delay between retries
+				}
+
+				if err != nil {
+					fmt.Printf("Error saving to database for %s after retries: %v\n", url, err)
+				} else {
+					fmt.Printf("Processed URL: %s\n", url)
+				}
 			}
 		}
 
 		// Release the slot back to the semaphore
 		<-semaphore
 	}
+}
+
+func urlExistsInDatabase(url string) bool {
+	var count int
+	err := db.Get(&count, "SELECT COUNT(*) FROM urls WHERE url = ?", url)
+	if err != nil {
+		fmt.Printf("Error checking URL existence: %v\n", err)
+		return false
+	}
+	return count > 0
 }
 
 func fetchURL(url string) (string, error) {
@@ -118,7 +146,7 @@ func fetchURL(url string) (string, error) {
 	return string(body), nil
 }
 
-func saveToDatabaseWithTransaction(url, content string) error {
+func saveToDatabaseWithRetry(url, content string) error {
 	tx, err := db.Beginx()
 	if err != nil {
 		return err
